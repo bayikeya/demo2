@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>複数画像切替付きスポット案内（自動音声版）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; text-align: center; }
+    #camera { width: 100vw; height: 100vh; object-fit: cover; position: absolute; top: 0; left: 0; z-index: -1; }
+    #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.6); padding: 10px; border-radius: 8px; z-index: 1; white-space: pre-wrap; }
+    #image { position: absolute; bottom: 180px; left: 50%; transform: translateX(-50%); width: 300px; height: 300px; object-fit: contain; display: none; z-index: 1; background: black; }
+    .btn { position: absolute; left: 50%; transform: translateX(-50%); background-color: #007BFF; color: white; border: none; padding: 10px 20px; font-size: 14px; border-radius: 8px; cursor: pointer; z-index: 2; display: none; }
+    #patternBtn { bottom: 70px; }
+    #nextBtn { bottom: 20px; }
+    .img-nav { position: absolute; bottom: 260px; z-index: 2; font-size: 20px; background: rgba(0,0,0,0.5); color: white; border: none; padding: 5px 15px; cursor: pointer; border-radius: 6px; }
+    #prevBtn { left: 10%; }
+    #nextImgBtn { right: 10%; }
+    #compassCanvas { position: absolute; top: 10px; right: 10px; width: 120px; height: 120px; z-index: 10; background: rgba(0,0,0,0.5); border-radius: 60px; }
+  </style>
+</head>
+<body>
+
+<video id="camera" autoplay playsinline muted></video>
+<div id="info">位置情報取得中...</div>
+<img id="image" src="" alt="スポット画像" />
+<button class="btn" id="patternBtn" onclick="switchPattern()">English</button>
+<button class="btn" id="nextBtn" onclick="goToNextSpot()">このスポットは完了</button>
+<button class="img-nav" id="prevBtn" onclick="showPrevImage()" style="display:none;">←</button>
+<button class="img-nav" id="nextImgBtn" onclick="showNextImage()" style="display:none;">→</button>
+<canvas id="compassCanvas" width="120" height="120"></canvas>
+<audio id="audio" src=""></audio>
+
+<script>
+// --- スポットデータ ---
+const spots = [
+  { name: "13号館前", lat: 35.69304350697483, lon: 140.05084706907195, radius: 0, images: ["image0.jpeg", "image1.jpeg"], audio: { A: "spot1.ja.mp3", B: "spot1.en.mp3", C: "spot1.ch.mp3" }},
+  { name: "曲がり角左１", lat: 35.693237099346376, lon: 140.0510123108731, radius: 10, images: ["image2.jpeg", "image10.jpeg"], audio: { A: "spot2.ja.mp3", B: "spot2.en.mp3", C: "spot2.ch.mp3" }},
+  { name: "曲がり角右１", lat: 35.6933688901654, lon: 140.05042624826697, radius: 10, images: ["image3.jpeg", "image11.jpeg"], audio: { A: "spot3,4.ja.mp3", B: "spot3,4.en.mp3", C: "spot3,4.ch.mp3" }},
+  { name: "曲がり角右２", lat: 35.69384574273443, lon: 140.05039255315654, radius: 10, images: ["image4.jpeg", "image13.jpeg"], audio: { A: "spot3,4.ja.mp3", B: "spot3,4.en.mp3", C: "spot3,4.ch.mp3" }},
+  { name: "曲がり角右３", lat: 35.69386114596397, lon: 140.0510468829086, radius: 10, images: ["image5.jpeg", "image14.jpeg"], audio: { A: "spot5,6.ja.mp3", B: "spot5,6.en.mp3", C: "spot5,6.ch.mp3" }},
+  { name: "曲がり角右４", lat: 35.69339288645685, lon: 140.0510468829086, radius: 10, images: ["image6.jpeg", "image15.jpeg"], audio: { A: "spot5,6.ja.mp3", B: "spot5,6.en.mp3", C: "spot5,6.ch.mp3" }},
+  { name: "曲がり角左２", lat: 35.69337440247251, lon: 140.0504285887079, radius: 10, images: ["image7.jpeg", "image16.jpeg"], audio: { A: "spot7,8.ja.mp3", B: "spot7,8.en.mp3", C: "spot7,8.ch.mp3" }},
+  { name: "曲がり角左３", lat: 35.692982445978856, lon: 140.0502512817421, radius: 10, images: ["image8.jpeg", "image17.jpeg"], audio: { A: "spot7,8.ja.mp3", B: "spot7,8.en.mp3", C: "spot7,8.ch.mp3" }},
+  { name: "目的地", lat: 35.69285055749237, lon: 140.05080838028817, radius: 10, images: ["image9.jpeg", "image18.jpeg"], audio: { A: "spot9.ja.mp3", B: "spot9.en.mp3", C: "spot9.ch.mp3" }}
+];
+
+let currentIndex = 0;
+let hasEnteredSpot = false;
+let currentSpot = null;
+let currentPattern = "A";
+let imageIndex = 0;
+
+// --- 追加: 状態変数 ---
+let rawLat = null, rawLon = null;
+let filteredLat = null, filteredLon = null;
+let lastTimestamp = null;
+let velocity = {lat: 0, lon: 0}; // カルマン用
+let heading = 0; // 端末の方位（北=0°）
+
+const camera = document.getElementById("camera");
+const info = document.getElementById("info");
+const image = document.getElementById("image");
+const nextBtn = document.getElementById("nextBtn");
+const patternBtn = document.getElementById("patternBtn");
+const audio = document.getElementById("audio");
+const prevBtn = document.getElementById("prevBtn");
+const nextImgBtn = document.getElementById("nextImgBtn");
+const compassCanvas = document.getElementById("compassCanvas");
+const ctx = compassCanvas.getContext('2d');
+
+// --- カメラ ---
+navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false })
+  .then(stream => camera.srcObject = stream)
+  .catch(err => alert("カメラへのアクセスに失敗しました: " + err));
+
+// --- 距離計算 ---
+function getDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+// --- 方位角計算 ---
+function getBearing(lat1, lon1, lat2, lon2) {
+  // 北から時計回り角度（度）を返す
+  const phi1 = lat1 * Math.PI / 180;
+  const phi2 = lat2 * Math.PI / 180;
+  const lambda1 = lon1 * Math.PI / 180;
+  const lambda2 = lon2 * Math.PI / 180;
+  const y = Math.sin(lambda2 - lambda1) * Math.cos(phi2);
+  const x = Math.cos(phi1)*Math.sin(phi2) - Math.sin(phi1)*Math.cos(phi2)*Math.cos(lambda2-lambda1);
+  let theta = Math.atan2(y, x) * 180 / Math.PI;
+  return (theta + 360) % 360;
+}
+
+// --- 簡易カルマンフィルタ（各軸独立） ---
+class Kalman {
+  constructor(r = 2, q = 0.02) {
+    this.r = r; // 観測ノイズ
+    this.q = q; // システムノイズ
+    this.a = 1; this.b = 0; this.c = 1;
+    this.cov = NaN;
+    this.x = NaN;
+  }
+  filter(z) {
+    if (isNaN(this.x)) {
+      this.x = z;
+      this.cov = 1;
+    } else {
+      // Prediction
+      this.cov += this.q;
+      // Kalman gain
+      const k = this.cov * this.c / (this.c * this.cov * this.c + this.r);
+      // Correction
+      this.x += k * (z - this.c * this.x);
+      this.cov = (1 - k * this.c) * this.cov;
+    }
+    return this.x;
+  }
+}
+const kalmanLat = new Kalman();
+const kalmanLon = new Kalman();
+
+// --- マップマッチング（簡易：スポット間直線補正） ---
+function mapMatching(lat, lon) {
+  // 現在地を、現在スポット-次スポット間の直線上に投影
+  if(currentIndex >= spots.length) return {lat, lon};
+  const start = currentIndex === 0 ? {lat, lon} : {lat: spots[currentIndex-1].lat, lon: spots[currentIndex-1].lon};
+  const end = {lat: spots[currentIndex].lat, lon: spots[currentIndex].lon};
+  // 緯度経度を直交座標換算
+  const toXY = (lat, lon) => {
+    const R = 6371000;
+    const x = R * lon * Math.PI / 180 * Math.cos(lat * Math.PI / 180);
+    const y = R * lat * Math.PI / 180;
+    return {x, y};
+  };
+  const fromXY = (x, y, refLat) => {
+    const R = 6371000;
+    const lat = y / R * 180 / Math.PI;
+    const lon = x / (R * Math.cos(refLat * Math.PI / 180)) * 180 / Math.PI;
+    return {lat, lon};
+  };
+  const p = toXY(lat, lon), a = toXY(start.lat, start.lon), b = toXY(end.lat, end.lon);
+  const ab = {x: b.x - a.x, y: b.y - a.y};
+  const ap = {x: p.x - a.x, y: p.y - a.y};
+  const ab2 = ab.x*ab.x + ab.y*ab.y;
+  const t = ab2 === 0 ? 0 : Math.max(0, Math.min(1, (ap.x*ab.x + ap.y*ab.y) / ab2));
+  const proj = {x: a.x + ab.x*t, y: a.y + ab.y*t};
+  const projLatLon = fromXY(proj.x, proj.y, lat);
+  return projLatLon;
+}
+
+// --- 位置情報・カルマン・マップマッチング適用 ---
+function checkProximity(lat, lon) {
+  rawLat = lat; rawLon = lon;
+
+  // カルマンフィルタで平滑化
+  filteredLat = kalmanLat.filter(lat);
+  filteredLon = kalmanLon.filter(lon);
+
+  // マップマッチング
+  const {lat: mmLat, lon: mmLon} = mapMatching(filteredLat, filteredLon);
+
+  if (currentIndex >= spots.length) {
+    info.innerText = "すべてのスポットを通過しました。";
+    hideAllUI();
+    return;
+  }
+  const spot = spots[currentIndex];
+  const distance = getDistance(mmLat, mmLon, spot.lat, spot.lon);
+  const range = spot.radius || 10;
+
+  info.innerText =
+    `現在地: 緯度 ${mmLat.toFixed(6)}, 経度 ${mmLon.toFixed(6)}\n` +
+    `次のスポット: ${spot.name}（${currentIndex + 1} / ${spots.length}）\n` +
+    `残り距離: ${distance.toFixed(1)}m`;
+
+  if (currentIndex >= 1 && !hasEnteredSpot && distance < range) {
+    showSpot(spot);
+  }
+
+  // 方位磁針描画
+  updateCompass(mmLat, mmLon);
+}
+
+function showSpot(spot) {
+  currentSpot = spot;
+  hasEnteredSpot = true;
+  imageIndex = 0;
+
+  audio.src = spot.audio[currentPattern];
+  image.src = spot.images[imageIndex];
+  image.style.display = "block";
+  nextBtn.style.display = "block";
+  patternBtn.style.display = "block";
+  prevBtn.style.display = spot.images.length > 1 ? "block" : "none";
+  nextImgBtn.style.display = spot.images.length > 1 ? "block" : "none";
+
+  audio.loop = true;
+  audio.play().catch(e => console.log("自動再生に失敗:", e));
+}
+
+function switchPattern() {
+  const patterns = ["A", "B", "C"];
+  const index = patterns.indexOf(currentPattern);
+  currentPattern = patterns[(index + 1) % patterns.length];
+  updatePatternButtonText();
+
+  if (currentSpot) {
+    audio.pause();
+    audio.src = currentSpot.audio[currentPattern];
+    audio.play().catch(e => console.log("自動再生に失敗:", e));
+  }
+}
+
+function showPrevImage() {
+  if (!currentSpot) return;
+  imageIndex = (imageIndex - 1 + currentSpot.images.length) % currentSpot.images.length;
+  image.src = currentSpot.images[imageIndex];
+}
+
+function showNextImage() {
+  if (!currentSpot) return;
+  imageIndex = (imageIndex + 1) % currentSpot.images.length;
+  image.src = currentSpot.images[imageIndex];
+}
+
+function updatePatternButtonText() {
+  let label = "";
+  switch (currentPattern) {
+    case "A": label = "English"; break;
+    case "B": label = "中文"; break;
+    case "C": label = "日本語"; break;
+  }
+  patternBtn.innerText = label;
+}
+
+function goToNextSpot() {
+  audio.pause();
+  currentIndex++;
+  hasEnteredSpot = false;
+  currentSpot = null;
+  hideAllUI();
+}
+
+function hideAllUI() {
+  image.style.display = "none";
+  nextBtn.style.display = "none";
+  patternBtn.style.display = "none";
+  prevBtn.style.display = "none";
+  nextImgBtn.style.display = "none";
+}
+
+// --- 端末IMU（方位取得） ---
+window.addEventListener('deviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation', function(event) {
+  // event.alpha: 端末の北基準角度（度）
+  if (event.absolute === true || typeof event.webkitCompassHeading !== "undefined") {
+    // iOS: webkitCompassHeading, Android: alpha
+    heading = (typeof event.webkitCompassHeading !== "undefined") ?
+      event.webkitCompassHeading :
+      360 - event.alpha; // alpha=0で北
+  } else if (typeof event.alpha === "number") {
+    heading = 360 - event.alpha;
+  }
+}, true);
+
+// --- 方位磁針キャンバス ---
+function updateCompass(myLat, myLon) {
+  ctx.clearRect(0, 0, 120, 120);
+
+  // 次スポット or 目的地の位置
+  let target;
+  if (currentIndex < spots.length) {
+    target = spots[currentIndex];
+  } else {
+    target = spots[spots.length-1];
+  }
+  const bearing = getBearing(myLat, myLon, target.lat, target.lon);
+
+  // 方位磁針円・N字
+  ctx.save();
+  ctx.translate(60, 60);
+  ctx.beginPath();
+  ctx.arc(0, 0, 55, 0, 2*Math.PI);
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.fillText("N", 0, -40);
+
+  // 自分の進行方向（北0度）に赤線
+  ctx.save();
+  ctx.rotate(-heading * Math.PI / 180);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -45);
+  ctx.strokeStyle = "#f00";
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ctx.restore();
+
+  // ターゲット方向への矢印
+  // 方位磁針上で、進行方向から見たターゲットの角度
+  let rel = ((bearing - heading) + 360) % 360;
+  ctx.save();
+  ctx.rotate(rel * Math.PI / 180);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -38);
+  ctx.lineTo(-7, -30);
+  ctx.moveTo(0, -38);
+  ctx.lineTo(7, -30);
+  ctx.strokeStyle = "#0ff";
+  ctx.lineWidth = 5;
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.restore();
+}
+
+// --- IMU: 加速度・回転も取得（今後利用できるようセット） ---
+window.addEventListener('devicemotion', function(event) {
+  // event.acceleration, event.accelerationIncludingGravity, event.rotationRate
+  // 必要なら、今後カルマンフィルタの速度推定等に利用可能
+}, true);
+
+// --- GPS ---
+if ("geolocation" in navigator) {
+  navigator.geolocation.watchPosition(
+    pos => checkProximity(pos.coords.latitude, pos.coords.longitude),
+    err => info.innerText = "位置情報の取得に失敗しました",
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+  );
+}
+
+window.onload = () => {
+  showSpot(spots[0]); // 起動時に最初のスポットを表示
+  updatePatternButtonText();
+  updateCompass(spots[0].lat, spots[0].lon);
+};
+</script>
+
+</body>
+</html>
